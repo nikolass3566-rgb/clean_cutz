@@ -7,12 +7,21 @@ import threading
 import os
 import uvicorn
 from fastapi import FastAPI
-
+import json
 # --- INICIJALIZACIJA ---
 app = FastAPI()
 
-# Proveri da li je putanja do json ključa ispravna
-cred = credentials.Certificate("serviceAccountKey.json")
+# Pokušaj da učitaš konfiguraciju iz varijable (za Render)
+firebase_config = os.environ.get('FIREBASE_CONFIG')
+
+if firebase_config:
+    # Render okruženje
+    cred_dict = json.loads(firebase_config)
+    cred = credentials.Certificate(cred_dict)
+else:
+    # Lokalno okruženje (tvoj PC)
+    cred = credentials.Certificate("serviceAccountKey.json")
+
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
