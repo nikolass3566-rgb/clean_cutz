@@ -32,7 +32,6 @@ def health_check():
 
 # --- FUNKCIJA ZA SLANJE ---
 def send_fcm_notification(token, title, body):
-    # Ako token ne postoji, označi kao poslato da se ne pokušava ponovo
     if not token:
         print("Token je None, preskačem slanje.")
         return True
@@ -114,22 +113,25 @@ def check_appointments_loop():
                     print(f"Korisnik {user_name} nema FCM token (izlogovan), preskačem.")
                     continue
 
-                # --- LOGIKA SLANJA ---
-                def send_to_all(title, body, flag_field):
-                    """Šalje na sve dostupne tokene, vraća True ako bar jedan uspe."""
-                    results = []
+                # --- LOGIKA SLANJA (bez duplikata) ---
+                def send_to_all(title, body):
+                    """Šalje notifikaciju na jedinstvene tokene (bez duplikata)."""
+                    tokens = set()
                     if token:
-                        results.append(send_fcm_notification(token, title, body))
+                        tokens.add(token)
                     if token_web:
-                        results.append(send_fcm_notification(token_web, title, body))
+                        tokens.add(token_web)
+
+                    results = []
+                    for t in tokens:
+                        results.append(send_fcm_notification(t, title, body))
                     return any(results)
 
                 # 2 SATA (119 - 121 min pre)
                 if 119 <= diff_minutes <= 121 and not appt.get('sent_2h'):
                     if send_to_all(
                         "Vidimo se uskoro!",
-                        f"Zdravo {user_name}, termin ti je za 2 sata.",
-                        'sent_2h'
+                        f"Zdravo {user_name}, termin ti je za 2 sata."
                     ):
                         db.collection('appointments').document(appt_id).update({'sent_2h': True})
                         print(f"sent_2h -> True za termin {appt_id}")
@@ -137,9 +139,8 @@ def check_appointments_loop():
                 # 1 SAT (59 - 61 min pre)
                 elif 59 <= diff_minutes <= 61 and not appt.get('sent_1h'):
                     if send_to_all(
-                        "Jos sat vremena!",
-                        f"{user_name}, tvoj termin kod {appt.get('employeeName')} je za 1h.",
-                        'sent_1h'
+                        "Još sat vremena!",
+                        f"{user_name}, tvoj termin kod {appt.get('employeeName')} je za 1h."
                     ):
                         db.collection('appointments').document(appt_id).update({'sent_1h': True})
                         print(f"sent_1h -> True za termin {appt_id}")
@@ -148,8 +149,7 @@ def check_appointments_loop():
                 elif 29 <= diff_minutes <= 31 and not appt.get('sent_30min'):
                     if send_to_all(
                         "Skoro je vreme!",
-                        f"{user_name}, vidimo se u salonu za 30 minuta!",
-                        'sent_30min'
+                        f"{user_name}, vidimo se u salonu za 30 minuta!"
                     ):
                         db.collection('appointments').document(appt_id).update({'sent_30min': True})
                         print(f"sent_30min -> True za termin {appt_id}")
