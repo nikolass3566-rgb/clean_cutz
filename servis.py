@@ -42,32 +42,27 @@ def health_check():
 # stignu iz više otvorenih tabova/PWA prozora u isto vreme) i pravim rukovanjem
 # mrtvim tokenima.
 # ──────────────────────────────────────────────
-def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=None):
+def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=None, url='/'):
     if not token:
         return True
 
+    # VAŽNO: šaljemo ISKLJUČIVO "data" payload, bez "notification" ključa.
+    # Ako poruka sadrži "notification" polje, browser je AUTOMATSKI prikaže
+    # čim stigne push event — pre nego što naš service-worker kod uopšte
+    # stigne do reči. Kombinovano sa self-registrovanim 'push' listenerom
+    # i/ili onBackgroundMessage-om u service workeru, to je davalo 2-3
+    # notifikacije za JEDNU poruku. Sa data-only porukom, PRIKAZ u potpunosti
+    # kontroliše naš JS kod u firebase-messaging-sw.js (samo onBackgroundMessage) —
+    # tačno jedan put prikaza.
     message = messaging.Message(
-        notification=messaging.Notification(title=title, body=body),
-        android=messaging.AndroidConfig(
-            priority='high',
-            notification=messaging.AndroidNotification(
-                channel_id='appointments_channel',
-                priority='max',
-                default_sound=True,
-                default_vibrate_timings=True,
-                tag=tag,
-            )
-        ),
-        webpush=messaging.WebpushConfig(
-            headers={'Urgency': 'high'},
-            notification=messaging.WebpushNotification(
-                title=title,
-                body=body,
-                tag=tag,           # ključno: isti tag => browser prikazuje JEDNU notifikaciju, ne gomilu
-                renotify=False,
-            ),
-            fcm_options=messaging.WebpushFCMOptions(),
-        ),
+        data={
+            'title': title,
+            'body': body,
+            'tag': tag,
+            'url': url,
+        },
+        android=messaging.AndroidConfig(priority='high'),
+        webpush=messaging.WebpushConfig(headers={'Urgency': 'high'}),
         token=token,
     )
     try:
