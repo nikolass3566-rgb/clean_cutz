@@ -1,6 +1,8 @@
 import firebase_admin
 from firebase_admin import credentials, messaging, firestore
+from firebase_admin.messaging import UnregisteredError, SenderIdMismatchError, ThirdPartyAuthError, QuotaExceededError
 from google.cloud.firestore_v1.base_query import FieldFilter
+from google.cloud import firestore as gcf
 import datetime
 import time
 import threading
@@ -26,14 +28,22 @@ db = firestore.client()
 OFFSET = datetime.timedelta(hours=2)
 TZ_LOCAL = datetime.timezone(OFFSET)
 
+# Tipovi grešaka koji znače "token je mrtav, obriši ga" — hvatamo prave Firebase exception klase,
+# ne string-matching, jer se poruke greške razlikuju između verzija SDK-a.
+DEAD_TOKEN_ERRORS = (UnregisteredError, SenderIdMismatchError, ThirdPartyAuthError)
+
 @app.get("/")
 def health_check():
     return {"status": "online", "timezone": "UTC+2"}
 
-# --- FUNKCIJA ZA SLANJE ---
-def send_fcm_notification(token, title, body):
+
+# ──────────────────────────────────────────────
+# SLANJE — sa webpush tag-om (kolapsira duplikate sa istog origina, čak i ako
+# stignu iz više otvorenih tabova/PWA prozora u isto vreme) i pravim rukovanjem
+# mrtvim tokenima.
+# ──────────────────────────────────────────────
+def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=None):
     if not token:
-        print("Token je None, preskačem slanje.")
         return True
 
     message = messaging.Message(
@@ -44,26 +54,76 @@ def send_fcm_notification(token, title, body):
                 channel_id='appointments_channel',
                 priority='max',
                 default_sound=True,
-                default_vibrate_timings=True
+                default_vibrate_timings=True,
+                tag=tag,
             )
         ),
-        token=token
+        webpush=messaging.WebpushConfig(
+            headers={'Urgency': 'high'},
+            notification=messaging.WebpushNotification(
+                title=title,
+                body=body,
+                tag=tag,           # ključno: isti tag => browser prikazuje JEDNU notifikaciju, ne gomilu
+                renotify=False,
+            ),
+            fcm_options=messaging.WebpushFCMOptions(),
+        ),
+        token=token,
     )
     try:
         messaging.send(message)
-        print(f"Notifikacija uspešno poslata: {title}")
+        print(f"Notifikacija poslata: {title} [{tag}]")
         return True
+    except DEAD_TOKEN_ERRORS as e:
+        print(f"Mrtav token ({type(e).__name__}) — brišem iz Firestore-a.")
+        if user_ref is not None and token_field is not None:
+            try:
+                user_ref.update({token_field: firestore.DELETE_FIELD})
+            except Exception as ce:
+                print(f"Nisam uspeo da obrišem token: {ce}")
+        return True  # tretiramo kao "obrađeno" da ne blokira reminder flag zauvek
+    except QuotaExceededError as e:
+        print(f"Kvota prekoračena, pokušaću ponovo kasnije: {e}")
+        return False
     except Exception as e:
         print(f"Greška pri slanju: {e}")
-        # Nevažeći ili istekli token — označi kao poslato da se ne ponavlja beskonačno
-        if "Requested entity was not found" in str(e) or "invalid-registration-token" in str(e):
-            print("Nevažeći FCM token — označavam kao poslato da preskočim ovaj termin.")
-            return True
         return False
 
-# --- GLAVNI LOOP ---
+
+# ──────────────────────────────────────────────
+# ATOMSKI "CLAIM" — sprečava duple pošiljke čak i ako dve instance servisa
+# (npr. preklapanje tokom redeploy-a) rade istovremeno. Samo jedna transakcija
+# uspe da postavi flag na True; druga vidi da je flag već True i odustaje.
+# ──────────────────────────────────────────────
+@firestore.transactional
+def _claim_transaction(transaction, appt_ref, flag_field):
+    snap = appt_ref.get(transaction=transaction)
+    if not snap.exists:
+        return False
+    if snap.get(flag_field):
+        return False  # neko drugi je već zauzeo ovaj reminder
+    transaction.update(appt_ref, {flag_field: True})
+    return True
+
+def claim_reminder(appt_ref, flag_field):
+    transaction = db.transaction()
+    return _claim_transaction(transaction, appt_ref, flag_field)
+
+
+def send_to_all(user_data, user_ref, title, body, tag):
+    token = user_data.get('fcmToken')
+    token_web = user_data.get('fcmTokenWeb')
+    ok = False
+    if token:
+        ok = send_fcm_notification(token, title, body, tag, user_ref, 'fcmToken') or ok
+    if token_web and token_web != token:
+        ok = send_fcm_notification(token_web, title, body, tag, user_ref, 'fcmTokenWeb') or ok
+    return ok
+
+
+# --- GLAVNI LOOP: podsetnici pre termina ---
 def check_appointments_loop():
-    print(f"Servis pokrenut u UTC+2 zoni...")
+    print("Servis za podsetnike pokrenut u UTC+2 zoni...")
 
     while True:
         try:
@@ -78,81 +138,55 @@ def check_appointments_loop():
                 appt = doc.to_dict()
                 appt_id = doc.id
                 start_time = appt.get('startTime')
-
                 if not start_time:
                     continue
 
-                # Konverzija vremena u lokalnu zonu
                 if start_time.tzinfo is None:
                     start_time = start_time.replace(tzinfo=TZ_LOCAL)
                 else:
                     start_time = start_time.astimezone(TZ_LOCAL)
 
                 diff_minutes = (start_time - now).total_seconds() / 60
-
-                # Preskoči termine koji su davno prošli
                 if diff_minutes < -5:
                     continue
 
-                # Uzmi podatke korisnika
                 client_id = appt.get('clientId')
                 if not client_id:
                     continue
 
-                user_doc = db.collection('users').document(client_id).get()
+                user_ref = db.collection('users').document(client_id)
+                user_doc = user_ref.get()
                 if not user_doc.exists:
                     continue
-
                 user_data = user_doc.to_dict()
-                token     = user_data.get('fcmToken')
-                token_web = user_data.get('fcmTokenWeb')
                 user_name = user_data.get('name', 'Klijent')
 
-                # Ako korisnik nema nijedan token, preskoči
-                if not token and not token_web:
-                    print(f"Korisnik {user_name} nema FCM token (izlogovan), preskačem.")
+                if not user_data.get('fcmToken') and not user_data.get('fcmTokenWeb'):
+                    print(f"Korisnik {user_name} nema FCM token, preskačem.")
                     continue
 
-                # --- LOGIKA SLANJA (bez duplikata) ---
-                def send_to_all(title, body):
-                    """Šalje notifikaciju na jedinstvene tokene (bez duplikata)."""
-                    tokens = set()
-                    if token:
-                        tokens.add(token)
-                    if token_web:
-                        tokens.add(token_web)
+                appt_ref = db.collection('appointments').document(appt_id)
 
-                    results = []
-                    for t in tokens:
-                        results.append(send_fcm_notification(t, title, body))
-                    return any(results)
-
-                # 2 SATA (119 - 121 min pre)
+                # 2 SATA
                 if 119 <= diff_minutes <= 121 and not appt.get('sent_2h'):
-                    if send_to_all(
-                        "Vidimo se uskoro!",
-                        f"Zdravo {user_name}, termin ti je za 2 sata."
-                    ):
-                        db.collection('appointments').document(appt_id).update({'sent_2h': True})
-                        print(f"sent_2h -> True za termin {appt_id}")
+                    if claim_reminder(appt_ref, 'sent_2h'):
+                        send_to_all(user_data, user_ref, "Vidimo se uskoro!",
+                                    f"Zdravo {user_name}, termin ti je za 2 sata.",
+                                    tag=f"appt-{appt_id}-2h")
 
-                # 1 SAT (59 - 61 min pre)
+                # 1 SAT
                 elif 59 <= diff_minutes <= 61 and not appt.get('sent_1h'):
-                    if send_to_all(
-                        "Još sat vremena!",
-                        f"{user_name}, tvoj termin kod {appt.get('employeeName')} je za 1h."
-                    ):
-                        db.collection('appointments').document(appt_id).update({'sent_1h': True})
-                        print(f"sent_1h -> True za termin {appt_id}")
+                    if claim_reminder(appt_ref, 'sent_1h'):
+                        send_to_all(user_data, user_ref, "Još sat vremena!",
+                                    f"{user_name}, tvoj termin kod {appt.get('employeeName')} je za 1h.",
+                                    tag=f"appt-{appt_id}-1h")
 
-                # 30 MINUTA (29 - 31 min pre)
+                # 30 MINUTA
                 elif 29 <= diff_minutes <= 31 and not appt.get('sent_30min'):
-                    if send_to_all(
-                        "Skoro je vreme!",
-                        f"{user_name}, vidimo se u salonu za 30 minuta!"
-                    ):
-                        db.collection('appointments').document(appt_id).update({'sent_30min': True})
-                        print(f"sent_30min -> True za termin {appt_id}")
+                    if claim_reminder(appt_ref, 'sent_30min'):
+                        send_to_all(user_data, user_ref, "Skoro je vreme!",
+                                    f"{user_name}, vidimo se u salonu za 30 minuta!",
+                                    tag=f"appt-{appt_id}-30min")
 
             time.sleep(60)
 
@@ -160,8 +194,76 @@ def check_appointments_loop():
             print(f"Greška u glavnom loopu: {e}")
             time.sleep(30)
 
-# Pokretanje pozadinskog thread-a
+
+# ──────────────────────────────────────────────
+# NOVO: trenutno obaveštenje ZAPOSLENOM kada klijent (ili admin u njegovo ime)
+# zakaže novi termin — real-time Firestore listener, ne čeka 60s petlju.
+# Preskačemo prvi "snapshot" (sadrži SVE postojeće dokumente kao ADDED) da ne
+# bismo bombardovali zaposlene starim terminima pri svakom restartu servisa.
+# ──────────────────────────────────────────────
+_first_snapshot_done = {'flag': False}
+
+def watch_new_appointments():
+    print("Osluškujem nove rezervacije za obaveštenja zaposlenima...")
+
+    def on_snapshot(col_snapshot, changes, read_time):
+        if not _first_snapshot_done['flag']:
+            # Ovo je inicijalni snapshot pri pokretanju — sadrži sve postojeće
+            # dokumente kao "ADDED". Preskačemo ga da ne šaljemo staru istoriju.
+            _first_snapshot_done['flag'] = True
+            return
+
+        for change in changes:
+            if change.type.name != 'ADDED':
+                continue
+
+            appt = change.document.to_dict()
+            appt_ref = change.document.reference
+
+            # Idempotentnost: ako je iz bilo kog razloga listener okinuo dvaput
+            # (rekonekcija itd.), claim garantuje da šaljemo samo jednom.
+            if appt.get('employeeNotified'):
+                continue
+            if not claim_reminder(appt_ref, 'employeeNotified'):
+                continue
+
+            employee_id = appt.get('employeeId')
+            if not employee_id or employee_id == '__any__':
+                continue
+
+            emp_doc = db.collection('users').document(employee_id).get()
+            if not emp_doc.exists:
+                continue
+            emp_data = emp_doc.to_dict()
+            emp_ref = db.collection('users').document(employee_id)
+
+            start_time = appt.get('startTime')
+            if start_time:
+                if start_time.tzinfo is None:
+                    start_time = start_time.replace(tzinfo=TZ_LOCAL)
+                else:
+                    start_time = start_time.astimezone(TZ_LOCAL)
+                when = start_time.strftime('%d.%m. u %H:%M')
+            else:
+                when = 'nepoznato vreme'
+
+            client_name = appt.get('clientName', 'Klijent')
+            service_name = appt.get('serviceName', 'Usluga')
+
+            send_to_all(
+                emp_data, emp_ref,
+                "Nova rezervacija!",
+                f"{client_name} je zakazao/la '{service_name}' — {when}.",
+                tag=f"new-appt-{change.document.id}",
+            )
+            print(f"Zaposleni {emp_data.get('name')} obavešten o novom terminu {change.document.id}")
+
+    db.collection('appointments').on_snapshot(on_snapshot)
+
+
+# Pokretanje pozadinskih thread-ova
 threading.Thread(target=check_appointments_loop, daemon=True).start()
+threading.Thread(target=watch_new_appointments, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
