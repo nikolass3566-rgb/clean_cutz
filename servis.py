@@ -105,6 +105,27 @@ def claim_reminder(appt_ref, flag_field):
     return _claim_transaction(transaction, appt_ref, flag_field)
 
 
+# ──────────────────────────────────────────────
+# ISTORIJA OBAVEŠTENJA (zvono u aplikaciji) — upisujemo je UVEK, nezavisno od
+# toga da li push uspe da stigne na uređaj. Tako zaposleni (i klijent) uvek
+# imaju trag ko je i kada zakazao, čak i ako je notifikacija sa uređaja nestala,
+# telefon bio ugašen, ili korisnik uopšte nije uključio push.
+# ──────────────────────────────────────────────
+def create_notification(user_id, title, body, appointment_id=None, ntype='info'):
+    try:
+        db.collection('notifications').add({
+            'userId': user_id,
+            'title': title,
+            'body': body,
+            'appointmentId': appointment_id,
+            'type': ntype,
+            'read': False,
+            'createdAt': firestore.SERVER_TIMESTAMP,
+        })
+    except Exception as e:
+        print(f"Nisam uspeo da upišem notifikaciju u istoriju: {e}")
+
+
 def send_to_all(user_data, user_ref, title, body, tag):
     token = user_data.get('fcmToken')
     token_web = user_data.get('fcmTokenWeb')
@@ -155,33 +176,35 @@ def check_appointments_loop():
                     continue
                 user_data = user_doc.to_dict()
                 user_name = user_data.get('name', 'Klijent')
-
-                if not user_data.get('fcmToken') and not user_data.get('fcmTokenWeb'):
-                    print(f"Korisnik {user_name} nema FCM token, preskačem.")
-                    continue
+                has_token = bool(user_data.get('fcmToken') or user_data.get('fcmTokenWeb'))
+                if not has_token:
+                    print(f"Korisnik {user_name} nema FCM token — upisujem samo u istoriju, bez push-a.")
 
                 appt_ref = db.collection('appointments').document(appt_id)
 
                 # 2 SATA
                 if 119 <= diff_minutes <= 121 and not appt.get('sent_2h'):
                     if claim_reminder(appt_ref, 'sent_2h'):
-                        send_to_all(user_data, user_ref, "Vidimo se uskoro!",
-                                    f"Zdravo {user_name}, termin ti je za 2 sata.",
-                                    tag=f"appt-{appt_id}-2h")
+                        title, body = "Vidimo se uskoro!", f"Zdravo {user_name}, termin ti je za 2 sata."
+                        create_notification(client_id, title, body, appt_id, 'reminder_2h')
+                        if has_token:
+                            send_to_all(user_data, user_ref, title, body, tag=f"appt-{appt_id}-2h")
 
                 # 1 SAT
                 elif 59 <= diff_minutes <= 61 and not appt.get('sent_1h'):
                     if claim_reminder(appt_ref, 'sent_1h'):
-                        send_to_all(user_data, user_ref, "Još sat vremena!",
-                                    f"{user_name}, tvoj termin kod {appt.get('employeeName')} je za 1h.",
-                                    tag=f"appt-{appt_id}-1h")
+                        title, body = "Još sat vremena!", f"{user_name}, tvoj termin kod {appt.get('employeeName')} je za 1h."
+                        create_notification(client_id, title, body, appt_id, 'reminder_1h')
+                        if has_token:
+                            send_to_all(user_data, user_ref, title, body, tag=f"appt-{appt_id}-1h")
 
                 # 30 MINUTA
                 elif 29 <= diff_minutes <= 31 and not appt.get('sent_30min'):
                     if claim_reminder(appt_ref, 'sent_30min'):
-                        send_to_all(user_data, user_ref, "Skoro je vreme!",
-                                    f"{user_name}, vidimo se u salonu za 30 minuta!",
-                                    tag=f"appt-{appt_id}-30min")
+                        title, body = "Skoro je vreme!", f"{user_name}, vidimo se u salonu za 30 minuta!"
+                        create_notification(client_id, title, body, appt_id, 'reminder_30min')
+                        if has_token:
+                            send_to_all(user_data, user_ref, title, body, tag=f"appt-{appt_id}-30min")
 
             time.sleep(60)
 
@@ -244,13 +267,17 @@ def watch_new_appointments():
 
             client_name = appt.get('clientName', 'Klijent')
             service_name = appt.get('serviceName', 'Usluga')
+            title = "Nova rezervacija!"
+            body = f"{client_name} je zakazao/la '{service_name}' — {when}."
 
-            send_to_all(
-                emp_data, emp_ref,
-                "Nova rezervacija!",
-                f"{client_name} je zakazao/la '{service_name}' — {when}.",
-                tag=f"new-appt-{change.document.id}",
-            )
+            # Istorija se upisuje UVEK, push samo ako zaposleni ima token —
+            # tako zaposleni uvek vidi ko je i kada zakazao čak i ako push kasni/ne stigne.
+            create_notification(employee_id, title, body, change.document.id, 'new_appointment')
+            if emp_data.get('fcmToken') or emp_data.get('fcmTokenWeb'):
+                send_to_all(emp_data, emp_ref, title, body, tag=f"new-appt-{change.document.id}")
+            else:
+                print(f"Zaposleni {emp_data.get('name')} nema FCM token — samo istorija upisana.")
+
             print(f"Zaposleni {emp_data.get('name')} obavešten o novom terminu {change.document.id}")
 
     db.collection('appointments').on_snapshot(on_snapshot)
