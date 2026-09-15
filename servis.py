@@ -89,13 +89,20 @@ def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=No
 # ATOMSKI "CLAIM" — sprečava duple pošiljke čak i ako dve instance servisa
 # (npr. preklapanje tokom redeploy-a) rade istovremeno. Samo jedna transakcija
 # uspe da postavi flag na True; druga vidi da je flag već True i odustaje.
+#
+# NAPOMENA (FIX): koristimo snap.to_dict() i .get() na običnom dict-u, a ne
+# snap.get(flag_field) direktno. DocumentSnapshot.get() baca KeyError ako
+# polje uopšte ne postoji u dokumentu (npr. potpuno nov appointment koji
+# još nikad nije imao sent_2h/sent_1h/sent_30min/employeeNotified polje) —
+# za razliku od dict.get() koje vraća None. To je izazivalo crash niže.
 # ──────────────────────────────────────────────
 @firestore.transactional
 def _claim_transaction(transaction, appt_ref, flag_field):
     snap = appt_ref.get(transaction=transaction)
     if not snap.exists:
         return False
-    if snap.get(flag_field):
+    data = snap.to_dict() or {}
+    if data.get(flag_field):
         return False  # neko drugi je već zauzeo ovaj reminder
     transaction.update(appt_ref, {flag_field: True})
     return True
@@ -225,60 +232,77 @@ def watch_new_appointments():
     print("Osluškujem nove rezervacije za obaveštenja zaposlenima...")
 
     def on_snapshot(col_snapshot, changes, read_time):
-        if not _first_snapshot_done['flag']:
-            # Ovo je inicijalni snapshot pri pokretanju — sadrži sve postojeće
-            # dokumente kao "ADDED". Preskačemo ga da ne šaljemo staru istoriju.
-            _first_snapshot_done['flag'] = True
-            return
+        # FIX: ceo callback je sada umotan u try/except. Ranije, jedan loš
+        # dokument (npr. KeyError iz claim_reminder) je bacao nekhvatanu
+        # grešku direktno na Firestore-ov interni watch/gRPC thread, koji je
+        # zbog toga TRAJNO umirao — posle toga zaposleni više NIKAD nisu
+        # dobijali real-time obaveštenja o novim rezervacijama, sve dok se
+        # servis ručno ne restartuje. Sada greška na jednoj promeni samo
+        # preskače tu promenu i loguje se, a listener nastavlja da radi.
+        try:
+            if not _first_snapshot_done['flag']:
+                # Ovo je inicijalni snapshot pri pokretanju — sadrži sve postojeće
+                # dokumente kao "ADDED". Preskačemo ga da ne šaljemo staru istoriju.
+                _first_snapshot_done['flag'] = True
+                return
 
-        for change in changes:
-            if change.type.name != 'ADDED':
-                continue
+            for change in changes:
+                try:
+                    if change.type.name != 'ADDED':
+                        continue
 
-            appt = change.document.to_dict()
-            appt_ref = change.document.reference
+                    appt = change.document.to_dict() or {}
+                    appt_ref = change.document.reference
 
-            # Idempotentnost: ako je iz bilo kog razloga listener okinuo dvaput
-            # (rekonekcija itd.), claim garantuje da šaljemo samo jednom.
-            if appt.get('employeeNotified'):
-                continue
-            if not claim_reminder(appt_ref, 'employeeNotified'):
-                continue
+                    # Idempotentnost: ako je iz bilo kog razloga listener okinuo dvaput
+                    # (rekonekcija itd.), claim garantuje da šaljemo samo jednom.
+                    if appt.get('employeeNotified'):
+                        continue
+                    if not claim_reminder(appt_ref, 'employeeNotified'):
+                        continue
 
-            employee_id = appt.get('employeeId')
-            if not employee_id or employee_id == '__any__':
-                continue
+                    employee_id = appt.get('employeeId')
+                    if not employee_id or employee_id == '__any__':
+                        continue
 
-            emp_doc = db.collection('users').document(employee_id).get()
-            if not emp_doc.exists:
-                continue
-            emp_data = emp_doc.to_dict()
-            emp_ref = db.collection('users').document(employee_id)
+                    emp_doc = db.collection('users').document(employee_id).get()
+                    if not emp_doc.exists:
+                        continue
+                    emp_data = emp_doc.to_dict()
+                    emp_ref = db.collection('users').document(employee_id)
 
-            start_time = appt.get('startTime')
-            if start_time:
-                if start_time.tzinfo is None:
-                    start_time = start_time.replace(tzinfo=TZ_LOCAL)
-                else:
-                    start_time = start_time.astimezone(TZ_LOCAL)
-                when = start_time.strftime('%d.%m. u %H:%M')
-            else:
-                when = 'nepoznato vreme'
+                    start_time = appt.get('startTime')
+                    if start_time:
+                        if start_time.tzinfo is None:
+                            start_time = start_time.replace(tzinfo=TZ_LOCAL)
+                        else:
+                            start_time = start_time.astimezone(TZ_LOCAL)
+                        when = start_time.strftime('%d.%m. u %H:%M')
+                    else:
+                        when = 'nepoznato vreme'
 
-            client_name = appt.get('clientName', 'Klijent')
-            service_name = appt.get('serviceName', 'Usluga')
-            title = "Nova rezervacija!"
-            body = f"{client_name} je zakazao/la '{service_name}' — {when}."
+                    client_name = appt.get('clientName', 'Klijent')
+                    service_name = appt.get('serviceName', 'Usluga')
+                    title = "Nova rezervacija!"
+                    body = f"{client_name} je zakazao/la '{service_name}' — {when}."
 
-            # Istorija se upisuje UVEK, push samo ako zaposleni ima token —
-            # tako zaposleni uvek vidi ko je i kada zakazao čak i ako push kasni/ne stigne.
-            create_notification(employee_id, title, body, change.document.id, 'new_appointment')
-            if emp_data.get('fcmToken') or emp_data.get('fcmTokenWeb'):
-                send_to_all(emp_data, emp_ref, title, body, tag=f"new-appt-{change.document.id}")
-            else:
-                print(f"Zaposleni {emp_data.get('name')} nema FCM token — samo istorija upisana.")
+                    # Istorija se upisuje UVEK, push samo ako zaposleni ima token —
+                    # tako zaposleni uvek vidi ko je i kada zakazao čak i ako push kasni/ne stigne.
+                    create_notification(employee_id, title, body, change.document.id, 'new_appointment')
+                    if emp_data.get('fcmToken') or emp_data.get('fcmTokenWeb'):
+                        send_to_all(emp_data, emp_ref, title, body, tag=f"new-appt-{change.document.id}")
+                    else:
+                        print(f"Zaposleni {emp_data.get('name')} nema FCM token — samo istorija upisana.")
 
-            print(f"Zaposleni {emp_data.get('name')} obavešten o novom terminu {change.document.id}")
+                    print(f"Zaposleni {emp_data.get('name')} obavešten o novom terminu {change.document.id}")
+
+                except Exception as inner_e:
+                    # Greška na POJEDINAČNOJ promeni ne sme da obori ceo listener.
+                    print(f"Greška pri obradi pojedinačne promene ({getattr(change.document, 'id', '?')}): {inner_e}")
+                    continue
+
+        except Exception as outer_e:
+            print(f"Greška u on_snapshot callback-u: {outer_e}")
 
     db.collection('appointments').on_snapshot(on_snapshot)
 
