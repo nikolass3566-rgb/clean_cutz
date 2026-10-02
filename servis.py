@@ -1,5 +1,5 @@
 import firebase_admin
-from firebase_admin import credentials, messaging, firestore
+from firebase_admin import credentials, messaging, firestore, auth as fb_auth
 from firebase_admin.messaging import UnregisteredError, SenderIdMismatchError, ThirdPartyAuthError, QuotaExceededError
 from google.cloud.firestore_v1.base_query import FieldFilter
 import datetime
@@ -7,11 +7,23 @@ import time
 import threading
 import os
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import json
 
 # --- INICIJALIZACIJA ---
 app = FastAPI()
+
+# CORS: aplikacija (browser) poziva admin endpointe. Autorizacija ide preko Firebase ID tokena,
+# pa je "*" bezbedno; po želji ograniči: ALLOWED_ORIGINS="https://tvoj-sajt.com,https://www.tvoj-sajt.com"
+_origins = [o.strip() for o in os.environ.get('ALLOWED_ORIGINS', '*').split(',') if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 firebase_config = os.environ.get('FIREBASE_CONFIG')
 
@@ -57,6 +69,146 @@ NEW_APPT_MAX_AGE_SECONDS = 15 * 60  # novu rezervaciju javljamo frizeru samo ako
 @app.get("/")
 def health_check():
     return {"status": "online", "timezone": "Europe/Belgrade"}
+
+
+
+# ──────────────────────────────────────────────
+# ADMIN ENDPOINTI — brisanje naloga (Authentication + Firestore), blokiranje i reset podataka.
+# Svaki poziv mora imati "Authorization: Bearer <Firebase ID token>" admina;
+# uloga se proverava u users/{uid}.role == 'admin' (klijent ne može da je falsifikuje).
+# ──────────────────────────────────────────────
+def require_admin(authorization):
+    if not authorization or not authorization.lower().startswith('bearer '):
+        raise HTTPException(status_code=401, detail="Nedostaje prijava.")
+    try:
+        decoded = fb_auth.verify_id_token(authorization[7:].strip())
+    except Exception:
+        raise HTTPException(status_code=401, detail="Nevažeća prijava. Prijavi se ponovo.")
+    uid = decoded.get('uid')
+    snap = db.collection('users').document(uid).get()
+    if not snap.exists or (snap.to_dict() or {}).get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Samo admin može ovo da uradi.")
+    return uid
+
+
+def load_target_client(caller_uid, target_uid):
+    """Vraća (ref, data) ciljnog KLIJENTA; odbija sebe, admine i frizere."""
+    if not target_uid or not isinstance(target_uid, str):
+        raise HTTPException(status_code=400, detail="Nedostaje korisnik.")
+    if target_uid == caller_uid:
+        raise HTTPException(status_code=400, detail="Ne možeš da upravljaš sopstvenim nalogom.")
+    ref = db.collection('users').document(target_uid)
+    snap = ref.get()
+    data = snap.to_dict() or {} if snap.exists else {}
+    role = data.get('role', 'client')
+    if role == 'admin':
+        raise HTTPException(status_code=400, detail="Admin nalog se ne može menjati odavde.")
+    if role == 'employee':
+        raise HTTPException(status_code=400, detail="Prvo ukloni ulogu frizera, pa onda upravljaj nalogom.")
+    return ref, data
+
+
+def delete_refs(refs):
+    refs = list(refs)
+    for i in range(0, len(refs), 400):
+        batch = db.batch()
+        for r in refs[i:i + 400]:
+            batch.delete(r)
+        batch.commit()
+    return len(refs)
+
+
+def wipe_collection(name):
+    total = 0
+    while True:
+        docs = list(db.collection(name).limit(400).stream())
+        if not docs:
+            break
+        total += delete_refs(d.reference for d in docs)
+    return total
+
+
+class UidBody(BaseModel):
+    uid: str
+
+
+class BlockBody(BaseModel):
+    uid: str
+    blocked: bool
+
+
+class ResetBody(BaseModel):
+    confirm: str
+
+
+@app.post("/admin/delete-user")
+def admin_delete_user(body: UidBody, authorization: str = Header(None)):
+    caller = require_admin(authorization)
+    ref, _data = load_target_client(caller, body.uid)
+
+    # 1) Authentication (prvo, da se korisnik više ne može prijaviti)
+    try:
+        fb_auth.delete_user(body.uid)
+    except fb_auth.UserNotFoundError:
+        pass
+    except Exception as e:
+        print(f"Brisanje iz Authentication nije uspelo: {e}")
+        raise HTTPException(status_code=500, detail="Brisanje iz Authentication nije uspelo.")
+
+    # 2) Njegovi termini + zaključani termini (da slotovi ne ostanu zauzeti)
+    appt_docs = list(db.collection('appointments').where(filter=FieldFilter('clientId', '==', body.uid)).stream())
+    to_delete = []
+    for d in appt_docs:
+        to_delete.append(d.reference)
+        to_delete.append(db.collection('busySlots').document(d.id))
+        for l in db.collection('slotLocks').where(filter=FieldFilter('apptId', '==', d.id)).stream():
+            to_delete.append(l.reference)
+
+    # 3) Njegova obaveštenja, profil (users) i javni zapis
+    for n in db.collection('notifications').where(filter=FieldFilter('userId', '==', body.uid)).stream():
+        to_delete.append(n.reference)
+    to_delete.append(ref)
+    to_delete.append(db.collection('publicStaff').document(body.uid))
+
+    count = delete_refs(to_delete)
+    print(f"Admin {caller} obrisao korisnika {body.uid} ({len(appt_docs)} termina, ukupno {count} dokumenata).")
+    return {"ok": True, "appointments": len(appt_docs)}
+
+
+@app.post("/admin/block-user")
+def admin_block_user(body: BlockBody, authorization: str = Header(None)):
+    caller = require_admin(authorization)
+    ref, _data = load_target_client(caller, body.uid)
+
+    # Onemogući / vrati nalog u Authentication — blokiran korisnik se ne može ni prijaviti
+    try:
+        fb_auth.update_user(body.uid, disabled=body.blocked)
+        if body.blocked:
+            fb_auth.revoke_refresh_tokens(body.uid)  # odjavi ga i sa već otvorenih sesija
+    except fb_auth.UserNotFoundError:
+        pass
+    except Exception as e:
+        print(f"Blokiranje u Authentication nije uspelo: {e}")
+        raise HTTPException(status_code=500, detail="Promena u Authentication nije uspela.")
+
+    ref.set({
+        'blocked': body.blocked,
+        'blockedAt': firestore.SERVER_TIMESTAMP if body.blocked else None,
+    }, merge=True)
+    print(f"Admin {caller}: korisnik {body.uid} blocked={body.blocked}")
+    return {"ok": True, "blocked": body.blocked}
+
+
+@app.post("/admin/reset-data")
+def admin_reset_data(body: ResetBody, authorization: str = Header(None)):
+    caller = require_admin(authorization)
+    if (body.confirm or '').strip().upper() != 'OBRISI':
+        raise HTTPException(status_code=400, detail="Potvrda nije ispravna.")
+    deleted = {}
+    for name in ('appointments', 'notifications', 'busySlots', 'slotLocks'):
+        deleted[name] = wipe_collection(name)
+    print(f"Admin {caller} resetovao podatke: {deleted}")
+    return {"ok": True, "deleted": deleted}
 
 
 def first_name(full_name, default='Klijent'):
