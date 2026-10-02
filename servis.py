@@ -2,7 +2,6 @@ import firebase_admin
 from firebase_admin import credentials, messaging, firestore
 from firebase_admin.messaging import UnregisteredError, SenderIdMismatchError, ThirdPartyAuthError, QuotaExceededError
 from google.cloud.firestore_v1.base_query import FieldFilter
-from google.cloud import firestore as gcf
 import datetime
 import time
 import threading
@@ -25,35 +24,63 @@ else:
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-OFFSET = datetime.timedelta(hours=2)
-TZ_LOCAL = datetime.timezone(OFFSET)
+# ──────────────────────────────────────────────
+# VREMENSKA ZONA — prava zona (automatski prelazi letnje/zimsko računanje vremena).
+# Ako na serveru nema tzdata baze, dodaj "tzdata" u requirements.txt.
+# ──────────────────────────────────────────────
+try:
+    from zoneinfo import ZoneInfo
+    TZ_LOCAL = ZoneInfo("Europe/Belgrade")
+except Exception as tz_err:
+    print(f"UPOZORENJE: zona Europe/Belgrade nije dostupna ({tz_err}) — koristim fiksno UTC+2. Dodaj 'tzdata' u requirements.txt.")
+    TZ_LOCAL = datetime.timezone(datetime.timedelta(hours=2))
 
-# Tipovi grešaka koji znače "token je mrtav, obriši ga" — hvatamo prave Firebase exception klase,
-# ne string-matching, jer se poruke greške razlikuju između verzija SDK-a.
+UTC = datetime.timezone.utc
+
+# Tipovi grešaka koji znače "token je mrtav, obriši ga".
 DEAD_TOKEN_ERRORS = (UnregisteredError, SenderIdMismatchError, ThirdPartyAuthError)
+
+# Podsetnici: prozor u minutima (min..max pre termina), flag u dokumentu termina,
+# tip obaveštenja (ikona u aplikaciji) i prag za preskakanje podsetnika
+# ako je termin zakazan već UNUTAR tog praga (npr. zakazano 40 min unapred → nema "za 2 sata").
+REMINDERS = [
+    {'min': 115, 'max': 121, 'flag': 'sent_2h',    'type': 'reminder_2h',    'threshold': 120},
+    {'min': 55,  'max': 61,  'flag': 'sent_1h',    'type': 'reminder_1h',    'threshold': 60},
+    {'min': 25,  'max': 31,  'flag': 'sent_30min', 'type': 'reminder_30min', 'threshold': 30},
+]
+
+PUSH_TTL_SECONDS = 30 * 60          # zakasneli push (telefon ugašen) se odbacuje posle 30 min
+NOTIF_KEEP_DAYS = 30                # istorija obaveštenja starija od ovoga se briše
+NEW_APPT_MAX_AGE_SECONDS = 15 * 60  # novu rezervaciju javljamo frizeru samo ako je mlađa od 15 min
+
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "timezone": "UTC+2"}
+    return {"status": "online", "timezone": "Europe/Belgrade"}
+
+
+def first_name(full_name, default='Klijent'):
+    parts = (full_name or '').strip().split()
+    return parts[0] if parts else default
+
+
+def to_local(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC).astimezone(TZ_LOCAL)
+    return dt.astimezone(TZ_LOCAL)
 
 
 # ──────────────────────────────────────────────
-# SLANJE — sa webpush tag-om (kolapsira duplikate sa istog origina, čak i ako
-# stignu iz više otvorenih tabova/PWA prozora u isto vreme) i pravim rukovanjem
-# mrtvim tokenima.
+# SLANJE — data-only payload (jedan prikaz, kontroliše ga service worker),
+# TTL da zakasneli push ne stigne posle termina, i pravo rukovanje mrtvim tokenima.
+# Vraća True ako je "obrađeno" (poslato ili token mrtav), False ako treba ponoviti.
 # ──────────────────────────────────────────────
 def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=None, url='/'):
     if not token:
         return True
 
-    # VAŽNO: šaljemo ISKLJUČIVO "data" payload, bez "notification" ključa.
-    # Ako poruka sadrži "notification" polje, browser je AUTOMATSKI prikaže
-    # čim stigne push event — pre nego što naš service-worker kod uopšte
-    # stigne do reči. Kombinovano sa self-registrovanim 'push' listenerom
-    # i/ili onBackgroundMessage-om u service workeru, to je davalo 2-3
-    # notifikacije za JEDNU poruku. Sa data-only porukom, PRIKAZ u potpunosti
-    # kontroliše naš JS kod u firebase-messaging-sw.js (samo onBackgroundMessage) —
-    # tačno jedan put prikaza.
     message = messaging.Message(
         data={
             'title': title,
@@ -61,8 +88,13 @@ def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=No
             'tag': tag,
             'url': url,
         },
-        android=messaging.AndroidConfig(priority='high'),
-        webpush=messaging.WebpushConfig(headers={'Urgency': 'high'}),
+        android=messaging.AndroidConfig(
+            priority='high',
+            ttl=datetime.timedelta(seconds=PUSH_TTL_SECONDS),
+        ),
+        webpush=messaging.WebpushConfig(
+            headers={'Urgency': 'high', 'TTL': str(PUSH_TTL_SECONDS)},
+        ),
         token=token,
     )
     try:
@@ -76,7 +108,7 @@ def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=No
                 user_ref.update({token_field: firestore.DELETE_FIELD})
             except Exception as ce:
                 print(f"Nisam uspeo da obrišem token: {ce}")
-        return True  # tretiramo kao "obrađeno" da ne blokira reminder flag zauvek
+        return True
     except QuotaExceededError as e:
         print(f"Kvota prekoračena, pokušaću ponovo kasnije: {e}")
         return False
@@ -86,15 +118,8 @@ def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=No
 
 
 # ──────────────────────────────────────────────
-# ATOMSKI "CLAIM" — sprečava duple pošiljke čak i ako dve instance servisa
-# (npr. preklapanje tokom redeploy-a) rade istovremeno. Samo jedna transakcija
-# uspe da postavi flag na True; druga vidi da je flag već True i odustaje.
-#
-# NAPOMENA (FIX): koristimo snap.to_dict() i .get() na običnom dict-u, a ne
-# snap.get(flag_field) direktno. DocumentSnapshot.get() baca KeyError ako
-# polje uopšte ne postoji u dokumentu (npr. potpuno nov appointment koji
-# još nikad nije imao sent_2h/sent_1h/sent_30min/employeeNotified polje) —
-# za razliku od dict.get() koje vraća None. To je izazivalo crash niže.
+# ATOMSKI "CLAIM" — samo jedna instanca/transakcija može da postavi flag.
+# release_flag() vraća flag na False kad slanje ne uspe, da se pokuša ponovo.
 # ──────────────────────────────────────────────
 @firestore.transactional
 def _claim_transaction(transaction, appt_ref, flag_field):
@@ -103,32 +128,44 @@ def _claim_transaction(transaction, appt_ref, flag_field):
         return False
     data = snap.to_dict() or {}
     if data.get(flag_field):
-        return False  # neko drugi je već zauzeo ovaj reminder
+        return False
     transaction.update(appt_ref, {flag_field: True})
     return True
+
 
 def claim_reminder(appt_ref, flag_field):
     transaction = db.transaction()
     return _claim_transaction(transaction, appt_ref, flag_field)
 
 
-# ──────────────────────────────────────────────
-# ISTORIJA OBAVEŠTENJA (zvono u aplikaciji) — upisujemo je UVEK, nezavisno od
-# toga da li push uspe da stigne na uređaj. Tako zaposleni (i klijent) uvek
-# imaju trag ko je i kada zakazao, čak i ako je notifikacija sa uređaja nestala,
-# telefon bio ugašen, ili korisnik uopšte nije uključio push.
-# ──────────────────────────────────────────────
-def create_notification(user_id, title, body, appointment_id=None, ntype='info'):
+def release_flag(appt_ref, flag_field):
     try:
-        db.collection('notifications').add({
-            'userId': user_id,
-            'title': title,
-            'body': body,
-            'appointmentId': appointment_id,
-            'type': ntype,
-            'read': False,
-            'createdAt': firestore.SERVER_TIMESTAMP,
-        })
+        appt_ref.update({flag_field: False})
+        print(f"Slanje nije uspelo — flag '{flag_field}' vraćen, pokušaću ponovo.")
+    except Exception as e:
+        print(f"Nisam uspeo da vratim flag '{flag_field}': {e}")
+
+
+# ──────────────────────────────────────────────
+# ISTORIJA OBAVEŠTENJA (zvono u aplikaciji). ID dokumenta je određen unapred
+# (npr. "<termin>_reminder_1h"), pa je upis idempotentan — ponovljen pokušaj
+# slanja nikad ne pravi duplikat u zvoncu.
+# ──────────────────────────────────────────────
+def create_notification(user_id, title, body, appointment_id=None, ntype='info', doc_id=None):
+    data = {
+        'userId': user_id,
+        'title': title,
+        'body': body,
+        'appointmentId': appointment_id,
+        'type': ntype,
+        'read': False,
+        'createdAt': firestore.SERVER_TIMESTAMP,
+    }
+    try:
+        if doc_id:
+            db.collection('notifications').document(doc_id).set(data)
+        else:
+            db.collection('notifications').add(data)
     except Exception as e:
         print(f"Nisam uspeo da upišem notifikaciju u istoriju: {e}")
 
@@ -144,172 +181,249 @@ def send_to_all(user_data, user_ref, title, body, tag):
     return ok
 
 
-# --- GLAVNI LOOP: podsetnici pre termina ---
+def has_push_token(user_data):
+    return bool(user_data.get('fcmToken') or user_data.get('fcmTokenWeb'))
+
+
+# ──────────────────────────────────────────────
+# PODSETNICI KLIJENTIMA (2h / 1h / 30min)
+# Čita SAMO termine koji počinju u narednih ~125 min (ne sve "confirmed").
+# Upit koristi samo jedno polje (startTime) → ne treba composite index;
+# status se proverava u kodu.
+# ──────────────────────────────────────────────
+def process_reminders():
+    now = datetime.datetime.now(UTC)
+    window_start = now - datetime.timedelta(minutes=5)
+    window_end = now + datetime.timedelta(minutes=125)
+
+    docs = db.collection('appointments') \
+        .where(filter=FieldFilter('startTime', '>=', window_start)) \
+        .where(filter=FieldFilter('startTime', '<=', window_end)) \
+        .stream()
+
+    users_cache = {}
+
+    def get_user(uid):
+        if uid not in users_cache:
+            ref = db.collection('users').document(uid)
+            snap = ref.get()
+            users_cache[uid] = (ref, snap.to_dict() or {}) if snap.exists else (None, None)
+        return users_cache[uid]
+
+    for doc in docs:
+        appt = doc.to_dict() or {}
+        if appt.get('status') != 'confirmed':
+            continue
+
+        start = appt.get('startTime')
+        client_id = appt.get('clientId')
+        if not start or not client_id:
+            continue
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=UTC)
+
+        diff_minutes = (start - now).total_seconds() / 60
+
+        reminder = next((r for r in REMINDERS
+                         if r['min'] <= diff_minutes <= r['max'] and not appt.get(r['flag'])), None)
+        if not reminder:
+            continue
+
+        appt_id = doc.id
+        appt_ref = doc.reference
+        flag = reminder['flag']
+
+        # Termin zakazan tek unutar praga (npr. 40 min unapred) → podsetnik "za 2h" nema smisla.
+        created = appt.get('createdAt')
+        if created is not None:
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            if created > start - datetime.timedelta(minutes=reminder['threshold']):
+                claim_reminder(appt_ref, flag)  # samo označi, bez slanja
+                continue
+
+        user_ref, user_data = get_user(client_id)
+        if user_data is None:
+            continue
+
+        if not claim_reminder(appt_ref, flag):
+            continue
+
+        name = first_name(user_data.get('name'))
+        hhmm = to_local(start).strftime('%H:%M')
+        emp = appt.get('employeeName')
+        kod = f" kod {emp}" if emp else ""
+
+        if flag == 'sent_2h':
+            title, body = "Vidimo se uskoro!", f"Zdravo {name}, termin ti je za 2 sata ({hhmm})."
+        elif flag == 'sent_1h':
+            title, body = "Još sat vremena!", f"{name}, tvoj termin{kod} je za 1 sat ({hhmm})."
+        else:
+            title, body = "Skoro je vreme!", f"{name}, vidimo se u salonu za 30 minuta ({hhmm})!"
+
+        # Istorija (zvono) — uvek, idempotentno
+        create_notification(client_id, title, body, appt_id, reminder['type'],
+                            doc_id=f"{appt_id}_{reminder['type']}")
+
+        if has_push_token(user_data):
+            ok = send_to_all(user_data, user_ref, title, body, tag=f"appt-{appt_id}-{flag}")
+            if not ok:
+                release_flag(appt_ref, flag)   # pokušaj ponovo u sledećem krugu
+        else:
+            print(f"Korisnik {name} nema FCM token — upisano samo u istoriju.")
+
+
+# ──────────────────────────────────────────────
+# ČIŠĆENJE stare istorije obaveštenja (jednom na sat)
+# ──────────────────────────────────────────────
+def cleanup_old_notifications():
+    try:
+        cutoff = datetime.datetime.now(UTC) - datetime.timedelta(days=NOTIF_KEEP_DAYS)
+        old = db.collection('notifications') \
+            .where(filter=FieldFilter('createdAt', '<', cutoff)) \
+            .limit(400).stream()
+        batch = db.batch()
+        n = 0
+        for d in old:
+            batch.delete(d.reference)
+            n += 1
+        if n:
+            batch.commit()
+            print(f"Obrisano {n} starih obaveštenja.")
+    except Exception as e:
+        print(f"Greška pri čišćenju obaveštenja: {e}")
+
+
 def check_appointments_loop():
-    print("Servis za podsetnike pokrenut u UTC+2 zoni...")
+    print("Servis za podsetnike pokrenut (Europe/Belgrade)...")
+    last_cleanup = 0.0
 
     while True:
+        started = time.time()
         try:
-            now = datetime.datetime.now(TZ_LOCAL)
-            print(f"Provera termina (Lokalno): {now.strftime('%H:%M:%S')}")
-
-            appointments = db.collection('appointments')\
-                .where(filter=FieldFilter('status', '==', 'confirmed'))\
-                .stream()
-
-            for doc in appointments:
-                appt = doc.to_dict()
-                appt_id = doc.id
-                start_time = appt.get('startTime')
-                if not start_time:
-                    continue
-
-                if start_time.tzinfo is None:
-                    start_time = start_time.replace(tzinfo=TZ_LOCAL)
-                else:
-                    start_time = start_time.astimezone(TZ_LOCAL)
-
-                diff_minutes = (start_time - now).total_seconds() / 60
-                if diff_minutes < -5:
-                    continue
-
-                client_id = appt.get('clientId')
-                if not client_id:
-                    continue
-
-                user_ref = db.collection('users').document(client_id)
-                user_doc = user_ref.get()
-                if not user_doc.exists:
-                    continue
-                user_data = user_doc.to_dict()
-                user_name = user_data.get('name', 'Klijent')
-                has_token = bool(user_data.get('fcmToken') or user_data.get('fcmTokenWeb'))
-                if not has_token:
-                    print(f"Korisnik {user_name} nema FCM token — upisujem samo u istoriju, bez push-a.")
-
-                appt_ref = db.collection('appointments').document(appt_id)
-
-                # 2 SATA
-                if 119 <= diff_minutes <= 121 and not appt.get('sent_2h'):
-                    if claim_reminder(appt_ref, 'sent_2h'):
-                        title, body = "Vidimo se uskoro!", f"Zdravo {user_name}, termin ti je za 2 sata."
-                        create_notification(client_id, title, body, appt_id, 'reminder_2h')
-                        if has_token:
-                            send_to_all(user_data, user_ref, title, body, tag=f"appt-{appt_id}-2h")
-
-                # 1 SAT
-                elif 59 <= diff_minutes <= 61 and not appt.get('sent_1h'):
-                    if claim_reminder(appt_ref, 'sent_1h'):
-                        title, body = "Još sat vremena!", f"{user_name}, tvoj termin kod {appt.get('employeeName')} je za 1h."
-                        create_notification(client_id, title, body, appt_id, 'reminder_1h')
-                        if has_token:
-                            send_to_all(user_data, user_ref, title, body, tag=f"appt-{appt_id}-1h")
-
-                # 30 MINUTA
-                elif 29 <= diff_minutes <= 31 and not appt.get('sent_30min'):
-                    if claim_reminder(appt_ref, 'sent_30min'):
-                        title, body = "Skoro je vreme!", f"{user_name}, vidimo se u salonu za 30 minuta!"
-                        create_notification(client_id, title, body, appt_id, 'reminder_30min')
-                        if has_token:
-                            send_to_all(user_data, user_ref, title, body, tag=f"appt-{appt_id}-30min")
-
-            time.sleep(60)
-
+            process_reminders()
+            if started - last_cleanup > 3600:
+                cleanup_old_notifications()
+                last_cleanup = started
         except Exception as e:
             print(f"Greška u glavnom loopu: {e}")
-            time.sleep(30)
+        time.sleep(max(5, 60 - (time.time() - started)))
 
 
 # ──────────────────────────────────────────────
-# NOVO: trenutno obaveštenje ZAPOSLENOM kada klijent (ili admin u njegovo ime)
-# zakaže novi termin — real-time Firestore listener, ne čeka 60s petlju.
-# Preskačemo prvi "snapshot" (sadrži SVE postojeće dokumente kao ADDED) da ne
-# bismo bombardovali zaposlene starim terminima pri svakom restartu servisa.
+# REAL-TIME: nova rezervacija → frizeru, otkazivanje → frizeru i klijentu.
+# Pratimo samo buduće termine. Prvi snapshot se NE preskače (da restart servisa
+# ne proguta rezervaciju), već se stare rezervacije filtriraju po createdAt;
+# claim flag garantuje da se šalje najviše jednom.
 # ──────────────────────────────────────────────
-_first_snapshot_done = {'flag': False}
+def notify_user(user_id, title, body, appt_id, ntype, doc_id, tag):
+    user_ref = db.collection('users').document(user_id)
+    snap = user_ref.get()
+    if not snap.exists:
+        return
+    user_data = snap.to_dict() or {}
+    create_notification(user_id, title, body, appt_id, ntype, doc_id=doc_id)
+    if has_push_token(user_data):
+        send_to_all(user_data, user_ref, title, body, tag=tag)
+    else:
+        print(f"{user_data.get('name')} nema FCM token — samo istorija upisana.")
 
-def watch_new_appointments():
-    print("Osluškujem nove rezervacije za obaveštenja zaposlenima...")
 
+def handle_new_appointment(doc):
+    appt = doc.to_dict() or {}
+    if appt.get('employeeNotified'):
+        return
+    if appt.get('status') not in ('confirmed', 'pending'):
+        return
+
+    created = appt.get('createdAt')
+    if created is not None:
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        if (datetime.datetime.now(UTC) - created).total_seconds() > NEW_APPT_MAX_AGE_SECONDS:
+            return  # stara rezervacija (npr. iz početnog snapshot-a)
+
+    employee_id = appt.get('employeeId')
+    if not employee_id or employee_id == '__any__':
+        return
+    if not claim_reminder(doc.reference, 'employeeNotified'):
+        return
+
+    start = to_local(appt.get('startTime'))
+    when = start.strftime('%d.%m. u %H:%M') if start else 'nepoznato vreme'
+    title = "Nova rezervacija!"
+    body = f"{appt.get('clientName', 'Klijent')} je zakazao/la '{appt.get('serviceName', 'Usluga')}' — {when}."
+
+    notify_user(employee_id, title, body, doc.id, 'new_appointment',
+                doc_id=f"{doc.id}_new_appointment", tag=f"new-appt-{doc.id}")
+    print(f"Frizer {employee_id} obavešten o novom terminu {doc.id}")
+
+
+def handle_cancelled_appointment(doc):
+    appt = doc.to_dict() or {}
+    if appt.get('status') != 'cancelled' or appt.get('cancelNotified'):
+        return
+    if not claim_reminder(doc.reference, 'cancelNotified'):
+        return
+
+    start = to_local(appt.get('startTime'))
+    when = start.strftime('%d.%m. u %H:%M') if start else 'nepoznato vreme'
+    service = appt.get('serviceName', 'Usluga')
+
+    employee_id = appt.get('employeeId')
+    if employee_id and employee_id != '__any__':
+        notify_user(employee_id, "Termin otkazan",
+                    f"Termin klijenta {appt.get('clientName', 'Klijent')} ('{service}') — {when} je otkazan.",
+                    doc.id, 'cancelled', doc_id=f"{doc.id}_cancelled_emp", tag=f"cancel-emp-{doc.id}")
+
+    client_id = appt.get('clientId')
+    if client_id:
+        notify_user(client_id, "Termin otkazan",
+                    f"Tvoj termin za '{service}' — {when} je otkazan.",
+                    doc.id, 'cancelled', doc_id=f"{doc.id}_cancelled_client", tag=f"cancel-client-{doc.id}")
+
+
+def start_watcher():
     def on_snapshot(col_snapshot, changes, read_time):
-        # FIX: ceo callback je sada umotan u try/except. Ranije, jedan loš
-        # dokument (npr. KeyError iz claim_reminder) je bacao nekhvatanu
-        # grešku direktno na Firestore-ov interni watch/gRPC thread, koji je
-        # zbog toga TRAJNO umirao — posle toga zaposleni više NIKAD nisu
-        # dobijali real-time obaveštenja o novim rezervacijama, sve dok se
-        # servis ručno ne restartuje. Sada greška na jednoj promeni samo
-        # preskače tu promenu i loguje se, a listener nastavlja da radi.
         try:
-            if not _first_snapshot_done['flag']:
-                # Ovo je inicijalni snapshot pri pokretanju — sadrži sve postojeće
-                # dokumente kao "ADDED". Preskačemo ga da ne šaljemo staru istoriju.
-                _first_snapshot_done['flag'] = True
-                return
-
             for change in changes:
                 try:
-                    if change.type.name != 'ADDED':
-                        continue
-
-                    appt = change.document.to_dict() or {}
-                    appt_ref = change.document.reference
-
-                    # Idempotentnost: ako je iz bilo kog razloga listener okinuo dvaput
-                    # (rekonekcija itd.), claim garantuje da šaljemo samo jednom.
-                    if appt.get('employeeNotified'):
-                        continue
-                    if not claim_reminder(appt_ref, 'employeeNotified'):
-                        continue
-
-                    employee_id = appt.get('employeeId')
-                    if not employee_id or employee_id == '__any__':
-                        continue
-
-                    emp_doc = db.collection('users').document(employee_id).get()
-                    if not emp_doc.exists:
-                        continue
-                    emp_data = emp_doc.to_dict()
-                    emp_ref = db.collection('users').document(employee_id)
-
-                    start_time = appt.get('startTime')
-                    if start_time:
-                        if start_time.tzinfo is None:
-                            start_time = start_time.replace(tzinfo=TZ_LOCAL)
-                        else:
-                            start_time = start_time.astimezone(TZ_LOCAL)
-                        when = start_time.strftime('%d.%m. u %H:%M')
-                    else:
-                        when = 'nepoznato vreme'
-
-                    client_name = appt.get('clientName', 'Klijent')
-                    service_name = appt.get('serviceName', 'Usluga')
-                    title = "Nova rezervacija!"
-                    body = f"{client_name} je zakazao/la '{service_name}' — {when}."
-
-                    # Istorija se upisuje UVEK, push samo ako zaposleni ima token —
-                    # tako zaposleni uvek vidi ko je i kada zakazao čak i ako push kasni/ne stigne.
-                    create_notification(employee_id, title, body, change.document.id, 'new_appointment')
-                    if emp_data.get('fcmToken') or emp_data.get('fcmTokenWeb'):
-                        send_to_all(emp_data, emp_ref, title, body, tag=f"new-appt-{change.document.id}")
-                    else:
-                        print(f"Zaposleni {emp_data.get('name')} nema FCM token — samo istorija upisana.")
-
-                    print(f"Zaposleni {emp_data.get('name')} obavešten o novom terminu {change.document.id}")
-
+                    kind = change.type.name
+                    if kind == 'ADDED':
+                        handle_new_appointment(change.document)
+                    elif kind == 'MODIFIED':
+                        handle_cancelled_appointment(change.document)
                 except Exception as inner_e:
-                    # Greška na POJEDINAČNOJ promeni ne sme da obori ceo listener.
-                    print(f"Greška pri obradi pojedinačne promene ({getattr(change.document, 'id', '?')}): {inner_e}")
-                    continue
-
+                    print(f"Greška pri obradi promene ({getattr(change.document, 'id', '?')}): {inner_e}")
         except Exception as outer_e:
             print(f"Greška u on_snapshot callback-u: {outer_e}")
 
-    db.collection('appointments').on_snapshot(on_snapshot)
+    q = db.collection('appointments') \
+        .where(filter=FieldFilter('startTime', '>=', datetime.datetime.now(UTC)))
+    return q.on_snapshot(on_snapshot)
+
+
+def watch_appointments():
+    print("Osluškujem nove i otkazane rezervacije...")
+    while True:
+        watch = None
+        try:
+            watch = start_watcher()
+        except Exception as e:
+            print(f"Greška pri pokretanju listenera: {e}")
+        # Obnavljamo listener na 6h — ako je veza tiho umrla, ovo ga vraća u život.
+        # Bezbedno je jer claim flagovi sprečavaju duplo slanje.
+        time.sleep(6 * 3600 if watch else 30)
+        try:
+            if watch:
+                watch.unsubscribe()
+        except Exception:
+            pass
 
 
 # Pokretanje pozadinskih thread-ova
 threading.Thread(target=check_appointments_loop, daemon=True).start()
-threading.Thread(target=watch_new_appointments, daemon=True).start()
+threading.Thread(target=watch_appointments, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
