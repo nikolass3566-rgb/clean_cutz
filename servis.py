@@ -420,8 +420,17 @@ def run_booking(transaction, caller_uid, caller, body, write):
         appt_snaps = _get_all([db.collection('appointments').document(i) for i in suspects], transaction)
         for sn in appt_snaps:
             # zaostali zapis otkazanog/obrisanog termina se ignoriše (i prepisuje); aktivan termin = zauzeto
-            if sn.exists and (sn.to_dict() or {}).get('status') in ACTIVE_STATUSES:
-                raise BookingError(409, "SLOT_TAKEN")
+            if not sn.exists:
+                continue
+            a = sn.to_dict() or {}
+            if a.get('status') not in ACTIVE_STATUSES:
+                continue
+            a_s, a_e = a.get('startTime'), a.get('endTime')
+            # Ćelije su zaokružene na 5 min pa mogu da "zahvate" sused koji se stvarno ne preklapa — proveravamo tačno.
+            if a_s is not None and a_e is not None and not (start < a_e + buf_td and end > a_s - buf_td):
+                continue
+            print(f"SLOT_TAKEN: frizer {emp_id}, traženo {start.isoformat()}–{end.isoformat()}, sukob sa terminom {sn.id} ({a_s}–{a_e}, status {a.get('status')})")
+            raise BookingError(409, "SLOT_TAKEN")
 
     result = {"ok": True, "free": True, "durationMinutes": duration, "price": price,
               "startMs": start_ms, "endMs": end_ms}
