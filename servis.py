@@ -259,7 +259,9 @@ def current_user(authorization):
 
 
 def _get_all(refs, transaction):
-    return list(db.get_all(refs, transaction=transaction))
+    """db.get_all NE garantuje redosled rezultata — vraćamo ih tačno onim redom kojim su traženi."""
+    found = {snap.reference.path: snap for snap in db.get_all(refs, transaction=transaction)}
+    return [found.get(r.path) or r.get(transaction=transaction) for r in refs]
 
 
 def _parse_hhmm(v, default):
