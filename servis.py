@@ -67,7 +67,7 @@ NOTIF_KEEP_DAYS = 30                # istorija obaveštenja starija od ovoga se 
 NEW_APPT_MAX_AGE_SECONDS = 15 * 60  # novu rezervaciju javljamo frizeru samo ako je mlađa od 15 min
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "online", "timezone": "Europe/Belgrade"}
 
@@ -227,6 +227,14 @@ MAX_SERVICES_PER_BOOKING = 8
 MAX_DAYS_AHEAD = int(os.environ.get('BOOKING_MAX_DAYS_AHEAD', '180'))
 ACTIVE_STATUSES = ('pending', 'confirmed')
 
+# Raspored frizera: svaki frizer sam unosi radno vreme po datumu (kolekcija employeeSchedules,
+# dokument "<empId>_<YYYY-MM-DD>"). Radno vreme salona (workingHours) i slobodni dani (blackoutDates)
+# ostaju spoljni okvir — lični raspored se SECE sa njim.
+# EMPLOYEE_SCHEDULE_REQUIRED=true  -> dan bez unetog rasporeda = frizer se ne može zakazati.
+# EMPLOYEE_SCHEDULE_REQUIRED=false -> dan bez unetog rasporeda = važi radno vreme salona (blaži prelaz).
+SCHEDULE_MAX_DAYS_AHEAD = int(os.environ.get('SCHEDULE_MAX_DAYS_AHEAD', '14'))
+EMPLOYEE_SCHEDULE_REQUIRED = os.environ.get('EMPLOYEE_SCHEDULE_REQUIRED', 'true').lower() != 'false'
+
 
 class BookingError(Exception):
     def __init__(self, status, detail):
@@ -342,7 +350,9 @@ def run_booking(transaction, caller_uid, caller, body, write):
     # ── radno vreme i slobodni dani ──
     local = start.astimezone(TZ_LOCAL)
     dow = str((local.weekday() + 1) % 7)            # JS getDay(): nedelja = 0
+    date_str = local.date().strftime('%Y-%m-%d')
     wh_snap = db.collection('workingHours').document(dow).get(transaction=transaction)
+    sched_snap = db.collection('employeeSchedules').document(f"{emp_id}_{date_str}").get(transaction=transaction)
     wh = (wh_snap.to_dict() or {}) if wh_snap.exists else {}
     if wh.get('isOpen') is False:
         raise BookingError(400, "Salon je zatvoren tog dana.")
@@ -351,9 +361,18 @@ def run_booking(transaction, caller_uid, caller, body, write):
     day = local.date()
     open_dt = datetime.datetime.combine(day, datetime.time(oh, om), tzinfo=TZ_LOCAL)
     close_dt = datetime.datetime.combine(day, datetime.time(ch, cm), tzinfo=TZ_LOCAL)
+    sc = (sched_snap.to_dict() or {}) if sched_snap.exists else None
+    if sc is None and EMPLOYEE_SCHEDULE_REQUIRED:
+        raise BookingError(400, "Frizer za taj dan nije uneo radno vreme.")
+    if sc is not None:
+        if sc.get('off'):
+            raise BookingError(400, "Frizer ne radi tog dana.")
+        sh, sm = _parse_hhmm(sc.get('start'), '10:00')
+        eh, em = _parse_hhmm(sc.get('end'), '20:00')
+        open_dt = max(open_dt, datetime.datetime.combine(day, datetime.time(sh, sm), tzinfo=TZ_LOCAL))
+        close_dt = min(close_dt, datetime.datetime.combine(day, datetime.time(eh, em), tzinfo=TZ_LOCAL))
     if start < open_dt or end > close_dt:
         raise BookingError(400, "Termin je van radnog vremena.")
-    date_str = day.strftime('%Y-%m-%d')
     blackout = list(db.collection('blackoutDates').where(filter=FieldFilter('date', '==', date_str)).limit(1).stream(transaction=transaction))
     if blackout:
         raise BookingError(400, "Salon je tog dana zatvoren.")
@@ -475,6 +494,105 @@ def api_book_check(body: BookBody, authorization: str = Header(None)):
         return run_booking(None, uid, caller, body, write=False)
     except BookingError as e:
         raise HTTPException(status_code=e.status, detail=e.detail)
+
+
+# ──────────────────────────────────────────────
+# RASPORED FRIZERA — frizer sam unosi radno vreme za narednih SCHEDULE_MAX_DAYS_AHEAD dana.
+# Ide preko servera (a ne direktno u Firestore) da bismo proverili:
+#  - format i opseg datuma, start < end, korak od 5 min
+#  - da se uklapa u radno vreme salona
+#  - da frizer ne "skrati" dan preko već zakazanih termina
+# ──────────────────────────────────────────────
+class DayEntry(BaseModel):
+    date: str                       # YYYY-MM-DD
+    off: bool = False               # true = ne radim taj dan
+    start: Optional[str] = None     # "HH:MM"
+    end: Optional[str] = None
+
+
+class ScheduleBody(BaseModel):
+    days: List[DayEntry]
+    employeeId: Optional[str] = None    # samo admin može da menja tuđi raspored
+
+
+def _hhmm_strict(v):
+    try:
+        h, m = str(v).split(':')
+        h, m = int(h), int(m)
+        if 0 <= h <= 23 and 0 <= m <= 59 and m % 5 == 0:
+            return h, m
+    except Exception:
+        pass
+    return None
+
+
+@app.post("/schedule/set")
+def api_schedule_set(body: ScheduleBody, authorization: str = Header(None)):
+    uid, caller = current_user(authorization)
+    role = caller.get('role', 'client')
+    if role not in ('employee', 'admin'):
+        raise HTTPException(status_code=403, detail="Samo frizer može da podešava radno vreme.")
+    emp_id = body.employeeId or uid
+    if emp_id != uid and role != 'admin':
+        raise HTTPException(status_code=403, detail="Možeš da menjaš samo svoj raspored.")
+    if not body.days or len(body.days) > 31:
+        raise HTTPException(status_code=400, detail="Nema dana za čuvanje.")
+
+    today = datetime.datetime.now(TZ_LOCAL).date()
+    last_day = today + datetime.timedelta(days=SCHEDULE_MAX_DAYS_AHEAD - 1)
+    writes = []
+    for e in body.days:
+        try:
+            day = datetime.date.fromisoformat(e.date)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Neispravan datum: {e.date}")
+        label = day.strftime('%d.%m.')
+        if day < today or day > last_day:
+            raise HTTPException(status_code=400, detail=f"{label} je van dozvoljenog perioda (narednih {SCHEDULE_MAX_DAYS_AHEAD} dana).")
+        doc = {'empId': emp_id, 'date': e.date, 'off': bool(e.off), 'updatedAt': firestore.SERVER_TIMESTAMP}
+        if e.off:
+            doc.update({'start': None, 'end': None})
+            new_lo = new_hi = None
+        else:
+            s_, e_ = _hhmm_strict(e.start), _hhmm_strict(e.end)
+            if not s_ or not e_:
+                raise HTTPException(status_code=400, detail=f"{label}: vreme mora biti u formatu HH:MM (korak 5 min).")
+            if s_ >= e_:
+                raise HTTPException(status_code=400, detail=f"{label}: kraj mora biti posle početka.")
+            dow = str((day.weekday() + 1) % 7)
+            wh = (db.collection('workingHours').document(dow).get().to_dict() or {})
+            if wh.get('isOpen') is False:
+                raise HTTPException(status_code=400, detail=f"{label}: salon je zatvoren tog dana.")
+            so, eo = _parse_hhmm(wh.get('open'), '10:00'), _parse_hhmm(wh.get('close'), '20:00')
+            if s_ < so or e_ > eo:
+                raise HTTPException(status_code=400, detail=f"{label}: salon radi {so[0]:02d}:{so[1]:02d}–{eo[0]:02d}:{eo[1]:02d}, unesi vreme u tom okviru.")
+            doc.update({'start': f"{s_[0]:02d}:{s_[1]:02d}", 'end': f"{e_[0]:02d}:{e_[1]:02d}"})
+            new_lo = datetime.datetime.combine(day, datetime.time(*s_), tzinfo=TZ_LOCAL)
+            new_hi = datetime.datetime.combine(day, datetime.time(*e_), tzinfo=TZ_LOCAL)
+
+        # postojeći aktivni termini tog dana moraju ostati unutar novog radnog vremena
+        d0 = datetime.datetime.combine(day, datetime.time(0, 0), tzinfo=TZ_LOCAL)
+        d1 = d0 + datetime.timedelta(days=1)
+        clash = []
+        for b in db.collection('busySlots') \
+                .where(filter=FieldFilter('start', '>=', d0)) \
+                .where(filter=FieldFilter('start', '<', d1)).stream():
+            bd = b.to_dict() or {}
+            if bd.get('empId') != emp_id or not bd.get('start') or not bd.get('end'):
+                continue
+            if new_lo is None or bd['start'] < new_lo or bd['end'] > new_hi:
+                clash.append(to_local(bd['start']).strftime('%H:%M'))
+        if clash:
+            raise HTTPException(status_code=409,
+                detail=f"{label}: imaš zakazane termine ({', '.join(sorted(clash))}) koji ne staju u novo radno vreme. Prvo ih otkaži ili proširi radno vreme.")
+        writes.append((db.collection('employeeSchedules').document(f"{emp_id}_{e.date}"), doc))
+
+    batch = db.batch()
+    for ref, doc in writes:
+        batch.set(ref, doc)
+    batch.commit()
+    print(f"Raspored: {emp_id} ažurirao {len(writes)} dana (poziva {uid})")
+    return {"ok": True, "saved": len(writes)}
 
 
 class CancelBody(BaseModel):
@@ -771,6 +889,17 @@ def cleanup_old_notifications():
         print(f"Greška pri čišćenju obaveštenja: {e}")
 
 
+def cleanup_old_schedules():
+    try:
+        cutoff = (datetime.datetime.now(TZ_LOCAL).date() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+        old = list(db.collection('employeeSchedules').where(filter=FieldFilter('date', '<', cutoff)).limit(400).stream())
+        if old:
+            delete_refs(d.reference for d in old)
+            print(f"Obrisano {len(old)} starih zapisa rasporeda.")
+    except Exception as e:
+        print(f"Greška pri čišćenju rasporeda: {e}")
+
+
 def check_appointments_loop():
     print("Servis za podsetnike pokrenut (Europe/Belgrade)...")
     last_cleanup = 0.0
@@ -785,6 +914,7 @@ def check_appointments_loop():
                 last_complete = started
             if started - last_cleanup > 3600:
                 cleanup_old_notifications()
+                cleanup_old_schedules()
                 last_cleanup = started
         except Exception as e:
             print(f"Greška u glavnom loopu: {e}")
