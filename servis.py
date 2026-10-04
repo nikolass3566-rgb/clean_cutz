@@ -604,6 +604,31 @@ def api_schedule_set(body: ScheduleBody, authorization: str = Header(None)):
     return {"ok": True, "saved": len(writes)}
 
 
+class PushTestBody(BaseModel):
+    delay: int = 10
+
+
+@app.post("/push/test")
+def api_push_test(body: PushTestBody, authorization: str = Header(None)):
+    """Šalje probno obaveštenje na sve sačuvane uređaje ulogovanog korisnika (posle 'delay' sekundi,
+    da stigneš da zaključaš telefon ili izađeš iz aplikacije). Rezultat slanja piše u Render log."""
+    uid, user = current_user(authorization)
+    tokens = collect_tokens(user)
+    if not tokens:
+        raise HTTPException(status_code=400, detail="Nema sačuvanog uređaja za obaveštenja. Dozvoli obaveštenja i otvori aplikaciju.")
+    delay = max(0, min(30, int(body.delay)))
+
+    def _run():
+        time.sleep(delay)
+        ref = db.collection('users').document(uid)
+        for tok, field in tokens.items():
+            print(f"PUSH TEST → {uid} / {field}")
+            send_fcm_notification(tok, "Probno obaveštenje", "Ako ovo vidiš u traci, obaveštenja rade.", f"test-{int(time.time())}", ref, field)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"ok": True, "devices": len(tokens), "delay": delay}
+
+
 class CancelBody(BaseModel):
     apptId: str
 
