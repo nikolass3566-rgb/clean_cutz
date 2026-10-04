@@ -718,20 +718,17 @@ def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=No
     if not token:
         return True
 
+    # Isto što šalje Firebase Console ("Send test message"): prava notification poruka.
+    # Prikaz u traci radi browser/Firebase sam, i kad je aplikacija zatvorena.
+    # 'data' ostaje da aplikacija (kad je otvorena) i klik mogu da koriste tag i url.
     message = messaging.Message(
+        notification=messaging.Notification(title=title, body=body),
         data={
             'title': title,
             'body': body,
             'tag': tag,
             'url': url,
         },
-        android=messaging.AndroidConfig(
-            priority='high',
-            ttl=datetime.timedelta(seconds=PUSH_TTL_SECONDS),
-        ),
-        webpush=messaging.WebpushConfig(
-            headers={'Urgency': 'high', 'TTL': str(PUSH_TTL_SECONDS)},
-        ),
         token=token,
     )
     try:
