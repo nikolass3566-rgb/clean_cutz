@@ -722,15 +722,14 @@ def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=No
     # Prikaz u traci radi browser/Firebase sam, i kad je aplikacija zatvorena.
     # 'data' ostaje da aplikacija (kad je otvorena) i klik mogu da koriste tag i url.
     message = messaging.Message(
-        notification=messaging.Notification(title=title, body=body),
-        data={
-            'title': title,
-            'body': body,
-            'tag': tag,
-            'url': url,
-        },
-        token=token,
-    )
+    data={
+        'title': str(title),
+        'body': str(body),
+        'tag': str(tag),
+        'url': str(url),
+    },
+    token=token,
+)
     try:
         messaging.send(message)
         print(f"Notifikacija poslata: {title} [{tag}]")
