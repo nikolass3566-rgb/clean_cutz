@@ -774,19 +774,28 @@ def create_notification(user_id, title, body, appointment_id=None, ntype='info',
         print(f"Nisam uspeo da upišem notifikaciju u istoriju: {e}")
 
 
+def collect_tokens(user_data):
+    """Svi tokeni korisnika (po uređaju: fcmTokens.<id>, plus stara polja) → {token: putanja polja}. Bez duplikata."""
+    out = {}
+    for dev, t in (user_data.get('fcmTokens') or {}).items():
+        if t:
+            out.setdefault(t, f'fcmTokens.{dev}')
+    for field in ('fcmToken', 'fcmTokenWeb'):
+        t = user_data.get(field)
+        if t:
+            out.setdefault(t, field)
+    return out
+
+
 def send_to_all(user_data, user_ref, title, body, tag):
-    token = user_data.get('fcmToken')
-    token_web = user_data.get('fcmTokenWeb')
     ok = False
-    if token:
-        ok = send_fcm_notification(token, title, body, tag, user_ref, 'fcmToken') or ok
-    if token_web and token_web != token:
-        ok = send_fcm_notification(token_web, title, body, tag, user_ref, 'fcmTokenWeb') or ok
+    for token, field in collect_tokens(user_data).items():
+        ok = send_fcm_notification(token, title, body, tag, user_ref, field) or ok
     return ok
 
 
 def has_push_token(user_data):
-    return bool(user_data.get('fcmToken') or user_data.get('fcmTokenWeb'))
+    return bool(collect_tokens(user_data))
 
 
 # ──────────────────────────────────────────────
