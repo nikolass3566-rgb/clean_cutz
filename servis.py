@@ -605,10 +605,10 @@ def api_schedule_set(body: ScheduleBody, authorization: str = Header(None)):
 
 
 @app.get("/push/ack")
-def push_ack(stage: str = "", v: str = "", clients: str = "", visible: str = "", shown: str = "", err: str = "", ua: str = ""):
+def push_ack(stage: str = "", v: str = "", clients: str = "", visible: str = "", focused: str = "", shown: str = "", err: str = "", note: str = "", ua: str = ""):
     """DIJAGNOSTIKA: service worker javlja šta je uradio sa push-om. Samo piše u log (skrati i očisti tekst)."""
     c = lambda x: str(x)[:120].replace('\n', ' ').replace('\r', ' ')
-    print(f"PUSH ACK stage={c(stage)} v={c(v)} clients={c(clients)} visible={c(visible)} shown={c(shown)} err={c(err)} ua={c(ua)}")
+    print(f"PUSH ACK stage={c(stage)} v={c(v)} clients={c(clients)} visible={c(visible)} focused={c(focused)} shown={c(shown)} err={c(err)} note={c(note)} ua={c(ua)}")
     return {"ok": True}
 
 
