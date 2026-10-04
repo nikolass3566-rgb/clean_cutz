@@ -731,6 +731,16 @@ def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=No
         ),
         webpush=messaging.WebpushConfig(
             headers={'Urgency': 'high', 'TTL': str(PUSH_TTL_SECONDS)},
+            # 'notification' deo prikazuje sam browser/Firebase, cak i kad je service worker uspavan
+            notification=messaging.WebpushNotification(
+                title=title,
+                body=body,
+                icon='/slike/clean-cutz-card.jpeg',
+                tag=tag,
+                renotify=True,
+                require_interaction=True,
+            ),
+            fcm_options=messaging.WebpushFCMOptions(link=url),
         ),
         token=token,
     )
