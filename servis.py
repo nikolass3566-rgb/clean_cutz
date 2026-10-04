@@ -604,6 +604,14 @@ def api_schedule_set(body: ScheduleBody, authorization: str = Header(None)):
     return {"ok": True, "saved": len(writes)}
 
 
+@app.get("/push/ack")
+def push_ack(stage: str = "", v: str = "", clients: str = "", visible: str = "", shown: str = "", err: str = "", ua: str = ""):
+    """DIJAGNOSTIKA: service worker javlja šta je uradio sa push-om. Samo piše u log (skrati i očisti tekst)."""
+    c = lambda x: str(x)[:120].replace('\n', ' ').replace('\r', ' ')
+    print(f"PUSH ACK stage={c(stage)} v={c(v)} clients={c(clients)} visible={c(visible)} shown={c(shown)} err={c(err)} ua={c(ua)}")
+    return {"ok": True}
+
+
 class PushTestBody(BaseModel):
     delay: int = 10
 
@@ -814,7 +822,9 @@ def collect_tokens(user_data):
 
 def send_to_all(user_data, user_ref, title, body, tag):
     ok = False
-    for token, field in collect_tokens(user_data).items():
+    toks = collect_tokens(user_data)
+    print(f"PUSH [{tag}] → {len(toks)} uređaja: {', '.join(toks.values()) or '—'}")
+    for token, field in toks.items():
         ok = send_fcm_notification(token, title, body, tag, user_ref, field) or ok
     return ok
 
