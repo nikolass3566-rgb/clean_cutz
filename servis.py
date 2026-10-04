@@ -63,9 +63,6 @@ REMINDERS = [
 ]
 
 PUSH_TTL_SECONDS = 30 * 60          # zakasneli push (telefon ugašen) se odbacuje posle 30 min
-# Apsolutni HTTPS URL sajta (FCM link mora biti apsolutan). Po želji postavi env APP_BASE_URL.
-APP_BASE_URL = os.environ.get('APP_BASE_URL', 'https://clean-cutz.onrender.com').rstrip('/')
-
 NOTIF_KEEP_DAYS = 30                # istorija obaveštenja starija od ovoga se briše
 NEW_APPT_MAX_AGE_SECONDS = 15 * 60  # novu rezervaciju javljamo frizeru samo ako je mlađa od 15 min
 
@@ -721,8 +718,6 @@ def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=No
     if not token:
         return True
 
-    link = url if str(url).startswith('https://') else APP_BASE_URL + '/' + str(url or '').lstrip('/')
-
     message = messaging.Message(
         data={
             'title': title,
@@ -736,16 +731,6 @@ def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=No
         ),
         webpush=messaging.WebpushConfig(
             headers={'Urgency': 'high', 'TTL': str(PUSH_TTL_SECONDS)},
-            # 'notification' deo prikazuje sam browser/Firebase, cak i kad je service worker uspavan
-            notification=messaging.WebpushNotification(
-                title=title,
-                body=body,
-                icon='/slike/clean-cutz-card.jpeg',
-                tag=tag,
-                renotify=True,
-                require_interaction=True,
-            ),
-            fcm_options=messaging.WebpushFCMOptions(link=link),
         ),
         token=token,
     )
