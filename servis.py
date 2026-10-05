@@ -62,7 +62,7 @@ REMINDERS = [
     {'min': 25,  'max': 31,  'flag': 'sent_30min', 'type': 'reminder_30min', 'threshold': 30},
 ]
 
-PUSH_TTL_SECONDS = 30 * 60          # zakasneli push (telefon ugašen) se odbacuje posle 30 min
+PUSH_TTL_SECONDS = 60 * 60          # zakasneli push (telefon ugašen/van mreže) se odbacuje posle 1 sata
 NOTIF_KEEP_DAYS = 30                # istorija obaveštenja starija od ovoga se briše
 NEW_APPT_MAX_AGE_SECONDS = 15 * 60  # novu rezervaciju javljamo frizeru samo ako je mlađa od 15 min
 
@@ -721,18 +721,22 @@ def send_fcm_notification(token, title, body, tag, user_ref=None, token_field=No
     # Isto što šalje Firebase Console ("Send test message"): prava notification poruka.
     # Prikaz u traci radi browser/Firebase sam, i kad je aplikacija zatvorena.
     # 'data' ostaje da aplikacija (kad je otvorena) i klik mogu da koriste tag i url.
+    # Visok prioritet je ključan za pouzdanu i trenutnu isporuku: bez 'Urgency: high' Android (Doze/App Standby)
+    # web push tretira kao običan i može da ga zadrži minutima ili satima, dok se telefon ne "probudi".
     message = messaging.Message(
-    data={
-        'title': str(title),
-        'body': str(body),
-        'tag': str(tag),
-        'url': str(url),
-    },
-    token=token,
-)
+        data={
+            'title': str(title),
+            'body': str(body),
+            'tag': str(tag),
+            'url': str(url),
+        },
+        android=messaging.AndroidConfig(priority='high', ttl=datetime.timedelta(seconds=PUSH_TTL_SECONDS)),
+        webpush=messaging.WebpushConfig(headers={'Urgency': 'high', 'TTL': str(PUSH_TTL_SECONDS)}),
+        token=token,
+    )
     try:
-        messaging.send(message)
-        print(f"Notifikacija poslata: {title} [{tag}]")
+        msg_id = messaging.send(message)
+        print(f"Notifikacija poslata: {title} [{tag}] id={msg_id}")
         return True
     except DEAD_TOKEN_ERRORS as e:
         print(f"Mrtav token ({type(e).__name__}) — brišem iz Firestore-a.")
